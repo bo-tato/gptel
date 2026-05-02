@@ -48,7 +48,27 @@ USAGE is part of the response, INFO is the request plist."
         (plist-put info :tokens tokens) ;Tokens for this turn
         (plist-put info :tokens-full    ;Tokens for full request
                    (gptel--sum-plists (plist-get info :tokens-full)
-                                      tokens))))))
+                                       tokens))))))
+
+(defun gptel--openai-responses-response-text (response)
+  "Extract output text from Responses API RESPONSE."
+  (let* ((response (or (plist-get response :response) response))
+         (direct (plist-get response :output_text)))
+    (or (and (stringp direct) (not (string-empty-p direct)) direct)
+        (when-let* ((output (plist-get response :output))
+                    ((vectorp output)))
+          (let (content-strs)
+            (cl-loop
+             for item across output
+             for content = (plist-get item :content)
+             when (vectorp content)
+             do (cl-loop
+                 for part across content
+                 when (and (equal (plist-get part :type) "output_text")
+                           (stringp (plist-get part :text)))
+                 do (push (plist-get part :text) content-strs)))
+            (when content-strs
+              (mapconcat #'identity (nreverse content-strs) "")))))))
 
 (cl-defmethod gptel-curl--parse-stream ((_backend gptel-openai-responses) info)
   "Parse an OpenAI Responses API data stream.
@@ -58,23 +78,32 @@ function.  Additionally, mutate state INFO to add tool-use
 information if the stream contains it."
   (let ((content-strs) wait)
     (condition-case nil
-        (while (and (not wait) (re-search-forward "^event: *\\(.+\\)" nil t))
+        (while (and (not wait)
+                    (re-search-forward "^\\(?:event: *\\(.+\\)\\|data:\\)" nil t))
           (let ((event-type (match-string 1)) data)
-            (forward-line 1)
-            (if (not (looking-at "data:" t))
-                (progn (goto-char (match-beginning 0)) ;not enough data, reset
-                       (setq wait t))
-              (forward-char 5)
-              (setq data (gptel--json-read))
+            (if event-type
+                (progn
+                  (forward-line 1)
+                  (if (not (looking-at "data:" t))
+                      (progn (goto-char (match-beginning 0)) ;not enough data, reset
+                             (setq wait t))
+                    (forward-char 5)
+                    (unless (looking-at " *\\[DONE\\]")
+                      (setq data (gptel--json-read)))))
+              (unless (looking-at " *\\[DONE\\]")
+                (setq data (gptel--json-read)
+                      event-type (plist-get data :type))))
+            (when data
               (pcase event-type
                 ;; Text content delta
                 ("response.output_text.delta"
-                 (when-let* ((delta (plist-get data :delta))
-                             ((not (string-empty-p delta))))
-                   (push delta content-strs)))
+                  (when-let* ((delta (plist-get data :delta))
+                              ((not (string-empty-p delta))))
+                    (plist-put info :openai-responses-seen-delta t)
+                    (push delta content-strs)))
                 ;; Function call arguments delta
                 ("response.function_call_arguments.delta"
-                 (when-let* ((delta (plist-get data :delta)))
+                  (when-let* ((delta (plist-get data :delta)))
                    (plist-put info :partial_json
                               (cons delta (plist-get info :partial_json)))))
                 ;; Function call completed (user-defined tools)
@@ -125,13 +154,18 @@ information if the stream contains it."
                               (list :type "function_call"
                                     :call_id (plist-get tc :id)
                                     :name (plist-get tc :name)
-                                    :arguments
-                                    (gptel--json-encode (plist-get tc :args))))
-                            tool-use)))
-                 (when-let* ((resp (plist-get data :response)))
-                   (plist-put info :stop-reason (plist-get resp :status))
-                   (gptel--openai-responses-update-tokens
-                    (plist-get resp :usage) info)))))))
+                                     :arguments
+                                     (gptel--json-encode (plist-get tc :args))))
+                             tool-use)))
+                  (when-let* ((resp (plist-get data :response)))
+                    (plist-put info :stop-reason (plist-get resp :status))
+                    (gptel--openai-responses-update-tokens
+                     (plist-get resp :usage) info)
+                    (when-let* ((text (gptel--openai-responses-response-text resp))
+                                ((not (or content-strs
+                                          (plist-get info :openai-responses-seen-delta)))))
+                      (push text content-strs)))
+                  (plist-put info :openai-responses-seen-delta nil))))))
       (error (goto-char (match-beginning 0))))
     (apply #'concat (nreverse content-strs))))
 
